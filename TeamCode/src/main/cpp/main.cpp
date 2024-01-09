@@ -1,4 +1,6 @@
 #include <memory>
+#include <optional>
+#include <ctime>
 #include <jni.h>
 #include "libcardinal.hpp"
 #include <apriltags/TagDetector.h>
@@ -9,6 +11,12 @@ enum MotorLocation {
     FRONT_RIGHT_MOTOR,
     BACK_LEFT_MOTOR,
     BACK_RIGHT_MOTOR,
+};
+
+enum ArmTarget {
+    TARGET_OUT = 0,
+    TARGET_MID = 1,
+    TARGET_IN = 2
 };
 
 //compilation params
@@ -28,7 +36,7 @@ enum MotorLocation {
 //certain other things
 //that do things
 #define  USE_MOTOR_CALIBRATION false
-#define  USE_CLAW false
+#define  USE_CLAW true
 
 //which motor is the anchor, i.e. which motor should every other
 //motor's ticks be pinned to
@@ -39,6 +47,22 @@ enum MotorLocation {
 #define  SPEED 0.9
 #define  ARM_SPEED 1.0
 
+//where the servo motor's open and closed positions are
+#define  LSERVO_OPEN 0.5
+#define  LSERVO_CLOSE 0.0
+#define  RSERVO_OPEN 0.0
+#define  RSERVO_CLOSE 0.4
+
+//Jules settings
+
+#define  JULES_P 0.8
+#define  JULES_I 0.0
+#define  JULES_D 0.2
+
+#define  INTERNAL_TARGET_OUT 100 //??
+#define  INTERNAL_TARGET_MID 50 //??
+#define  INTERNAL_TARGET_IN 0 //??
+
 //how we implement print(...)
 #define  print(...) __android_log_print(ANDROID_LOG_INFO,LOGGER_NAME,__VA_ARGS__)
 
@@ -46,12 +70,31 @@ static jvalue speed = {.d=ARM_SPEED};
 static jvalue zero = {.d=0.0};
 static jvalue neg_speed = {.d=-ARM_SPEED};
 
-double toRadians(double degrees) {
+static inline double toRadians(double degrees) {
     return (degrees * M_PI) / 180.0;
 }
 
-double toDegrees(double radians) {
+static inline double toDegrees(double radians) {
     return (radians * 180.0) / M_PI;
+}
+
+static inline int getTargetTicks(ArmTarget target) {
+    switch (target) {
+        case TARGET_OUT: return INTERNAL_TARGET_OUT;
+        case TARGET_MID: return INTERNAL_TARGET_MID;
+        case TARGET_IN: return INTERNAL_TARGET_IN;
+        default: {
+            print("Got bad ArmTarget: %i", target);
+            //put some sort of java error handling wizardry here
+            //or a POSIX signal or something
+        }
+    }
+}
+
+long micro_time() {
+    timeval tv{};
+    gettimeofday(&tv, nullptr);
+    return tv.tv_usec + tv.tv_sec * 1000000;
 }
 
 template <typename T> struct OneValPerMotor {
@@ -62,6 +105,47 @@ template <typename T> struct OneValPerMotor {
 };
 
 const OneValPerMotor<double> DEFAULT_VALUES = {.fl=1.0,.fr=1.0,.bl=1.0,.br=1.0};
+
+struct Jules {
+    explicit Jules(double K_p = 0.0, double K_i = 0.0, double K_d = 0.0, std::optional<double> integral_limit = std::optional<double>()) : K_p(K_p), K_i(K_i), K_d(K_d), integral_limit(integral_limit) {
+        this->reset();
+    }
+
+    void reset() {
+        this->last_error = 0.0;
+        this->integral = 0.0;
+        this->last_time = micro_time();
+    }
+
+    double operator() (double error, std::optional<double> error_derivative = {}) {
+        long current_time = micro_time();
+        long dt = current_time - this->last_time;
+        if (dt == 0.0) return 0.0;
+        this->last_time = current_time;
+        this->integral = this->_get_integral(error, dt);
+        double derivative = error_derivative ? error_derivative.value() : this->_get_derivative(error, dt);
+        double output = this->K_p * error + this->K_i * this->integral + this->K_d * derivative;
+        this->last_error = error;
+        return output;
+    }
+
+private:
+    double K_p, K_i, K_d, last_error{}, integral{};
+    long last_time{};
+    std::optional<double> integral_limit;
+
+    [[nodiscard]] double _get_integral(double error, double dt) const {
+        double _integral = this->integral + error * dt;
+        if (this->integral_limit) {
+            _integral = max(-integral_limit.value(), min(integral_limit.value(), _integral));
+        }
+        return _integral;
+    }
+
+    [[nodiscard]] double _get_derivative(double error, double dt) const {
+        return (error - this->last_error) / dt;
+    }
+};
 
 struct Drivetrain {
     JNIEnv * env;
@@ -78,26 +162,18 @@ struct Drivetrain {
 #endif
 
     Drivetrain(JNIEnv * env, jobject opMode) : isDead(false), env(env), opMode(env->NewGlobalRef(opMode)) {
-        print("Setting up drivetrain...");
         this->frontLeft = env->NewGlobalRef(libcardinal::altenv_get_device_from_hardware_map(env, opMode, "drivefl", "com/qualcomm/robotcore/hardware/DcMotor"));
-        print("Set up front left motor...");
         this->frontRight = env->NewGlobalRef(libcardinal::altenv_get_device_from_hardware_map(env, opMode, "drivefr", "com/qualcomm/robotcore/hardware/DcMotor"));
-        print("Set up front right motor...");
         this->backLeft = env->NewGlobalRef(libcardinal::altenv_get_device_from_hardware_map(env, opMode, "drivebl", "com/qualcomm/robotcore/hardware/DcMotor"));
-        print("Set up back left motor...");
         this->backRight = env->NewGlobalRef(libcardinal::altenv_get_device_from_hardware_map(env, opMode, "drivebr", "com/qualcomm/robotcore/hardware/DcMotor"));
-        print("Set up back right motor...");
         this->imu = env->NewGlobalRef(libcardinal::altenv_get_device_from_hardware_map(env, opMode, "imu", "com/qualcomm/robotcore/hardware/IMU"));
-        print("Set up IMU...");
         this->gamepad = env->NewGlobalRef(libcardinal::altenv_get_field(env, opMode, "gamepad1", "Lcom/qualcomm/robotcore/hardware/Gamepad;").l);
-        print("Set up gamepad...");
-        jvalue reversed = libcardinal::altenv_get_static_field(env, env->FindClass("com/qualcomm/robotcore/hardware/DcMotorSimple$Direction"), "REVERSE", "Lcom/qualcomm/robotcore/hardware/DcMotorSimple$Direction;");
+        //jvalue reversed = libcardinal::altenv_get_static_field(env, env->FindClass("com/qualcomm/robotcore/hardware/DcMotorSimple$Direction"), "REVERSE", "Lcom/qualcomm/robotcore/hardware/DcMotorSimple$Direction;");
         //libcardinal::call_void_instance(this->frontLeft, "setDirection", "(Lcom/qualcomm/robotcore/hardware/DcMotorSimple$Direction;)V", &reversed);
-        libcardinal::call_void_instance(this->frontRight, "setDirection", "(Lcom/qualcomm/robotcore/hardware/DcMotorSimple$Direction;)V", &reversed);
+        //libcardinal::call_void_instance(this->frontRight, "setDirection", "(Lcom/qualcomm/robotcore/hardware/DcMotorSimple$Direction;)V", &reversed);
         libcardinal::call_void_instance(this->imu, "resetYaw", "()V", nullptr);
     }
     ~Drivetrain() {
-        print("Destructing drivetrain...");
         this->env->DeleteGlobalRef(this->frontLeft);
         this->env->DeleteGlobalRef(this->frontRight);
         this->env->DeleteGlobalRef(this->backLeft);
@@ -165,6 +241,8 @@ struct Drivetrain {
     }
 #endif
 
+    void setTarget(long ticks) const {}
+
     [[nodiscard]] double getYaw() const {
         if (this->isDead) return 0.0;
         jobject yawPitchRollAngles = libcardinal::altenv_call_instance(this->env, this->imu, "getRobotYawPitchRollAngles", "()Lorg/firstinspires/ftc/robotcore/external/navigation/YawPitchRollAngles;", nullptr).l;
@@ -180,10 +258,10 @@ struct Drivetrain {
     void loop() const {
         //make sure that the robot turns off correctly
         if (this->isDead) return;
-        double yaw = this->getYaw();
+        //double yaw = this->getYaw();
         //strafing
-        double x = -(double)(libcardinal::altenv_get_field(this->env, this->gamepad, "left_stick_y", "F").f); //drive
-        double y = -(double)(libcardinal::altenv_get_field(this->env, this->gamepad, "left_stick_x", "F").f); //strafe
+        double x = (double)(libcardinal::altenv_get_field(this->env, this->gamepad, "left_stick_y", "F").f); //drive
+        double y = (double)(libcardinal::altenv_get_field(this->env, this->gamepad, "left_stick_x", "F").f); //strafe
         bool slow = libcardinal::altenv_get_field(this->env, this->gamepad, "left_trigger", "F").f >= 0.7f;
 #if USE_DRIVER_ORIENTED
         //reorienting
@@ -196,7 +274,7 @@ struct Drivetrain {
         y = rotatedMove(0);
 #endif
         //turning
-        double rx = -(double)(libcardinal::altenv_get_field(this->env, this->gamepad, "right_stick_x", "F").f); //turn
+        double rx = (double)(libcardinal::altenv_get_field(this->env, this->gamepad, "right_stick_x", "F").f); //turn
         //swinging
 #if USE_SWING
         double ry = -(double)(libcardinal::altenv_get_field(this->env, this->gamepad, "right_stick_y", "F").f); //swing
@@ -213,6 +291,7 @@ struct Drivetrain {
     void update(double drive, double strafe, double turn, bool slow = false) const {
 #endif
         if (this->isDead) return;
+
         //thresholding
         drive = abs(drive) > 0.6 ? -drive : 0.0;
         strafe = abs(strafe) > 0.6 ? -strafe : 0.0;
@@ -237,10 +316,10 @@ struct Drivetrain {
         jvalue pbackLeft = {.d=(-drive+turn-strafe)*SPEED};
         jvalue pbackRight = {.d=(-drive-turn-strafe)*SPEED};
 #else
-        jvalue pfrontLeft = {.d=(drive+turn-strafe)*SPEED};
-        jvalue pfrontRight = {.d=(drive-turn-strafe)*SPEED};
-        jvalue pbackLeft = {.d=(drive+turn+strafe)*SPEED};
-        jvalue pbackRight = {.d=(drive-turn+strafe)*SPEED};
+        jvalue pfrontLeft = {.d=(drive-turn-strafe)*SPEED};
+        jvalue pfrontRight = {.d=(-drive-turn-strafe)*SPEED};
+        jvalue pbackLeft = {.d=(drive-turn+strafe)*SPEED};
+        jvalue pbackRight = {.d=(drive+turn-strafe)*SPEED};
 #endif
 #endif
 #if USE_MOTOR_CALIBRATION
@@ -254,6 +333,7 @@ struct Drivetrain {
         libcardinal::altenv_call_void_instance(this->env, this->frontRight, "setPower", "(D)V", &pfrontRight);
         libcardinal::altenv_call_void_instance(this->env, this->backLeft, "setPower", "(D)V", &pbackLeft);
         libcardinal::altenv_call_void_instance(this->env, this->backRight, "setPower", "(D)V", &pbackRight);
+        print("backLeft: %li, backRight, %li", libcardinal::altenv_call_instance(this->env, this->backLeft, "getCurrentPosition", "()I", nullptr).i, libcardinal::altenv_call_instance(this->env, this->backRight, "getCurrentPosition", "()I", nullptr).i);
         //reset encoders for better multiplier calculation
 #if USE_MOTOR_CALIBRATION
         this->calculateMultipliers();
@@ -271,8 +351,10 @@ struct Arm {
     //jobject arm_t;
     jobject gamepad;
     bool isDead;
+    Jules jules;
+    ArmTarget target;
 
-    Arm(JNIEnv * env, jobject opMode) : isDead(false), env(env), opMode(env->NewGlobalRef(opMode)) {
+    Arm(JNIEnv * env, jobject opMode) : isDead(false), env(env), opMode(env->NewGlobalRef(opMode)), jules(JULES_P, JULES_I, JULES_D) {
         this->arm_bl = env->NewGlobalRef(libcardinal::altenv_get_device_from_hardware_map(env, opMode, "armbl", "com/qualcomm/robotcore/hardware/DcMotor"));
         this->arm_br = env->NewGlobalRef(libcardinal::altenv_get_device_from_hardware_map(env, opMode, "armbr", "com/qualcomm/robotcore/hardware/DcMotor"));
         //this->arm_t = env->NewGlobalRef(libcardinal::altenv_get_device_from_hardware_map(env, opMode, "armt", "com/qualcomm/robotcore/hardware/DcMotor"));
@@ -292,19 +374,9 @@ struct Arm {
         //this->env->DeleteGlobalRef(this->arm_t);
     }
 
-    void log_encoders() const {
-        if (this->isDead) return;
-        int arm_bl_ticks = abs(libcardinal::altenv_call_instance(this->env, this->arm_bl, "getCurrentPosition", "()I", nullptr).i);
-        int arm_br_ticks = abs(libcardinal::altenv_call_instance(this->env, this->arm_br, "getCurrentPosition", "()I", nullptr).i);
-        //int arm_t_ticks = abs(libcardinal::altenv_call_instance(this->env, this->arm_t, "getCurrentPosition", "()I", nullptr).i);
-        print("Encoder ticks: (arm_bl: %i), (arm_br: %i), (arm_t: %i)", arm_bl_ticks, arm_br_ticks, arm_t_ticks);
-    }
+    void log_encoders() const {}
 
-    [[nodiscard]] jvalue * get_static() const {
-
-    }
-
-    void loop() const {
+    void loop() {
         if (this->isDead) return;
         bool dpad_up = libcardinal::altenv_get_field(this->env, this->gamepad, "dpad_up", "Z").z;
         bool dpad_down = libcardinal::altenv_get_field(this->env, this->gamepad, "dpad_down", "Z").z;
@@ -313,17 +385,24 @@ struct Arm {
         this->log_encoders();
     }
 
-    void update(bool dpad_up, bool dpad_down/*, double ry*/) const {
+    void update(bool dpad_up, bool dpad_down/*, double ry*/) {
         if (this->isDead) return;
         if (dpad_up and dpad_down) {
             print("WARNING: Virtual UP and DOWN pressed at same time. Nothing will happen.");
             dpad_up = false;
             dpad_down = false;
         }
-        jvalue * upref = dpad_up ? &speed : (dpad_down ? &neg_speed : &zero);
-        jvalue * downref = dpad_up ? &neg_speed : (dpad_down ? &speed : &zero);
-        libcardinal::altenv_call_void_instance(this->env, this->arm_bl, "setPower", "(D)V", upref);
-        libcardinal::altenv_call_void_instance(this->env, this->arm_br, "setPower", "(D)V", downref);
+        if (dpad_up) {
+            this->target = (ArmTarget)((int)this->target + 1);
+            if ((int)this->target > 2) this->target = (ArmTarget)2;
+        } else if (dpad_down) {
+            this->target = (ArmTarget)((int)this->target - 1);
+            if ((int)this->target < 0) this->target = (ArmTarget)0;
+        }
+        jvalue power = {.d=this->jules(getTargetTicks(this->target) - libcardinal::altenv_call_instance(this->env, this->arm_bl,"getCurrentPosition", "()I",nullptr).i)};
+        jvalue negpower = {.d=-power.d};
+        libcardinal::altenv_call_void_instance(this->env, this->arm_bl, "setPower", "(D)V", &power);
+        libcardinal::altenv_call_void_instance(this->env, this->arm_br, "setPower", "(D)V", &negpower);
         //libcardinal::altenv_call_void_instance(this->env, this->arm_t, "setPower", "(D)V", ry > 0.8 ? (ry > 0.0 ? const_cast<jvalue *>(&speed) : const_cast<jvalue *>(&neg_speed)) : const_cast<jvalue *>(&zero));
     }
 };
@@ -333,22 +412,35 @@ struct Arm {
 struct Claw {
     JNIEnv * env;
     jobject opMode;
-    jobject wrist;
     jobject lclaw;
     jobject rclaw;
+    jobject gamepad;
 
     Claw(JNIEnv * env, jobject opMode) : env(env), opMode(opMode) {
-        this->wrist = env->NewGlobalRef(libcardinal::get_device_from_hardware_map(opMode, "wrist", "com/qualcomm/robotcore/hardware/Servo"));
-        this->lclaw = env->NewGlobalRef(libcardinal::get_device_from_hardware_map(opMode, "lclaw", "com/qualcomm/robotcore/hardware/Servo"));
-        this->rclaw = env->NewGlobalRef(libcardinal::get_device_from_hardware_map(opMode, "rclaw", "com/qualcomm/robotcore/hardware/Servo"));
+        print("CLAW INIT");
+        this->lclaw = env->NewGlobalRef(libcardinal::altenv_get_device_from_hardware_map(env, opMode, "lclaw", "com/qualcomm/robotcore/hardware/Servo"));
+        this->rclaw = env->NewGlobalRef(libcardinal::altenv_get_device_from_hardware_map(env, opMode, "rclaw", "com/qualcomm/robotcore/hardware/Servo"));
+        this->gamepad = env->NewGlobalRef(libcardinal::altenv_get_field(env, opMode, "gamepad1", "Lcom/qualcomm/robotcore/hardware/Gamepad;").l);
+    }
+
+    ~Claw() {
+        this->env->DeleteGlobalRef(this->lclaw);
+        this->env->DeleteGlobalRef(this->rclaw);
+        this->env->DeleteGlobalRef(this->gamepad);
     }
 
     void loop() const {
-
+        bool open = libcardinal::altenv_get_field(this->env, this->gamepad, "right_bumper", "Z").z == JNI_TRUE;
+        double lposition = open ? LSERVO_OPEN : LSERVO_CLOSE;
+        double rposition = open ? RSERVO_OPEN : RSERVO_CLOSE;
+        this->update(lposition, rposition);
     }
 
-    void vloop(double mwrist, double mlclaw, double mrclaw) const {
-
+    void update(double mlclaw, double mrclaw) const {
+        jvalue mlclaw_v = {.d=mlclaw};
+        jvalue mrclaw_v = {.d=mrclaw};
+        libcardinal::altenv_call_void_instance(this->env, this->lclaw, "setPosition", "(D)V", &mlclaw_v);
+        libcardinal::altenv_call_void_instance(this->env, this->rclaw, "setPosition", "(D)V", &mrclaw_v);
     }
 };
 #endif
@@ -380,6 +472,68 @@ void run(JNIEnv * env, jobject thiz) {
     }
 }
 
+enum AutoControllerInstruction {
+    FORWARD,
+    BACKWARD,
+    LEFT,
+    RIGHT,
+    CLOCKWISE,
+    COUNTERCLOCKWISE,
+    DROP,
+    UP,
+    DOWN
+};
+
+struct AutoController {
+    JNIEnv * env;
+    jobject opMode;
+    Drivetrain& drivetrain;
+    Arm& arm;
+    Claw& claw;
+
+    AutoController(JNIEnv * env, jobject opMode, Drivetrain& drivetrain, Arm& arm, Claw& claw) : env(env), opMode(opMode), drivetrain(drivetrain), arm(arm), claw(claw) {}
+    ~AutoController() = default;
+
+    void forward(int tiles) {queue.emplace_back(FORWARD, tiles);}
+    void backward(int tiles) {queue.emplace_back(BACKWARD, tiles);}
+    void left(int tiles) {queue.emplace_back(LEFT, tiles);}
+    void right(int tiles) {queue.emplace_back(RIGHT, tiles);}
+    void clockwise(double degrees) {queue.emplace_back(CLOCKWISE, degrees);}
+    void counterclockwise(double degrees) {queue.emplace_back(COUNTERCLOCKWISE, degrees);}
+    void drop() {queue.emplace_back(DROP, 0);}
+    void down() {queue.emplace_back(DOWN, 0);}
+    void up() {queue.emplace_back(UP, 0);}
+
+    void step() {
+        switch (this->queue[this->instruction].first) {
+            case FORWARD: {
+                if (!this->has_target) {
+                    this->targetTicks = -AutoController::ticksPerTile;
+                    this->has_target = true;
+                }
+                break;
+            }
+            case BACKWARD: {break;}
+            case LEFT: {break;}
+            case RIGHT: {break;}
+            case CLOCKWISE: {break;}
+            case COUNTERCLOCKWISE: {break;}
+            case DROP: {break;}
+            case UP: {break;}
+            case DOWN: {break;}
+            default: return;
+        }
+    }
+
+private:
+    std::vector<std::pair<AutoControllerInstruction, int>> queue;
+    int instruction;
+    bool has_target;
+    long targetTicks;
+    static const long ticksPerTile = 435;
+    static const long ticksToRotate = 800;
+};
+
 //Shorthand for the JNI function below
 void runAutoBoard(JNIEnv * env, jobject thiz) {
     /**
@@ -387,9 +541,16 @@ void runAutoBoard(JNIEnv * env, jobject thiz) {
      * **/
     libcardinal::setenv(env);
     Drivetrain drivetrain(env, thiz);
+    Arm arm(env, thiz);
+    Claw claw(env, thiz);
+    AutoController controller(env, thiz, drivetrain, arm, claw);
+    controller.forward(1);
+    controller.counterclockwise(90);
+    controller.forward(1);
+    controller.drop();
     libcardinal::call_void_instance(thiz, "waitForStart", "()V", nullptr);
     while (libcardinal::call_instance(thiz, "opModeIsActive", "()V", nullptr).z == JNI_TRUE) {
-        //move left twice
+        controller.step();
     }
 }
 
@@ -399,9 +560,19 @@ void runAutoStage(JNIEnv * env, jobject thiz) {
      * **/
     libcardinal::setenv(env);
     Drivetrain drivetrain(env, thiz);
+    Arm arm(env, thiz);
+    Claw claw(env, thiz);
+    AutoController controller(env, thiz, drivetrain, arm, claw);
+    controller.forward(2);
+    controller.down();
+    controller.left(3);
+    controller.up();
+    controller.counterclockwise(90);
+    controller.left(1);
+    controller.drop();
     libcardinal::call_void_instance(thiz, "waitForStart", "()V", nullptr);
     while (libcardinal::call_instance(thiz, "waitForStart", "()V", nullptr).z == JNI_TRUE) {
-        //move forwards twice, then left four or five times
+        controller.step();
     }
 }
 
