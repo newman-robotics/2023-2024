@@ -5,6 +5,11 @@
 #include "libcardinal.hpp"
 #include <apriltags/TagDetector.h>
 #include <android/log.h>
+#include <cstdlib>
+
+//how we implement print(...)
+#define  LOGGER_NAME "El J.U.L.I.O. L.I."
+#define  print(...) __android_log_print(ANDROID_LOG_INFO,LOGGER_NAME,__VA_ARGS__)
 
 enum MotorLocation {
     FRONT_LEFT_MOTOR,
@@ -21,11 +26,13 @@ enum ArmTarget {
 
 //compilation params
 
-//the name of the logger
-#define  LOGGER_NAME "El J.U.L.I.O. L.I."
-
 //whether to use driver oriented driving
 #define  USE_DRIVER_ORIENTED false
+
+//whether to use the jules
+//Jules is stupid and doesn't know how to make a functional jules,
+//so don't turn this on unless trying (in vain) to calibrate the jules
+#define  USE_JULES false
 
 //which one of these two uses of the right joystick should be used
 //do NOT EVER enable both of them, or weird things will happen
@@ -33,10 +40,15 @@ enum ArmTarget {
 #define  USE_SWING false
 #define  USE_ARM true
 
+//gamepad controls
+#define  INVERT_X true
+#define  INVERT_Y true
+
 //certain other things
 //that do things
 #define  USE_MOTOR_CALIBRATION false
 #define  USE_CLAW true
+#define  USE_CTC true
 
 //which motor is the anchor, i.e. which motor should every other
 //motor's ticks be pinned to
@@ -45,7 +57,7 @@ enum ArmTarget {
 //the speed multiplier of the motors
 //0.0 is none, 1.0 is full
 #define  SPEED 0.9
-#define  ARM_SPEED 1.0
+#define  ARM_SPEED 0.8
 
 //where the servo motor's open and closed positions are
 #define  LSERVO_OPEN 0.5
@@ -63,9 +75,6 @@ enum ArmTarget {
 #define  INTERNAL_TARGET_MID 50 //??
 #define  INTERNAL_TARGET_IN 0 //??
 
-//how we implement print(...)
-#define  print(...) __android_log_print(ANDROID_LOG_INFO,LOGGER_NAME,__VA_ARGS__)
-
 static jvalue speed = {.d=ARM_SPEED};
 static jvalue zero = {.d=0.0};
 static jvalue neg_speed = {.d=-ARM_SPEED};
@@ -78,6 +87,7 @@ static inline double toDegrees(double radians) {
     return (radians * 180.0) / M_PI;
 }
 
+#if USE_JULES
 static inline int getTargetTicks(ArmTarget target) {
     switch (target) {
         case TARGET_OUT: return INTERNAL_TARGET_OUT;
@@ -87,9 +97,13 @@ static inline int getTargetTicks(ArmTarget target) {
             print("Got bad ArmTarget: %i", target);
             //put some sort of java error handling wizardry here
             //or a POSIX signal or something
+            //or just...
+            std::exit(-1);
+            //yaaaay!
         }
     }
 }
+#endif
 
 long micro_time() {
     timeval tv{};
@@ -106,6 +120,7 @@ template <typename T> struct OneValPerMotor {
 
 const OneValPerMotor<double> DEFAULT_VALUES = {.fl=1.0,.fr=1.0,.bl=1.0,.br=1.0};
 
+#if USE_JULES
 struct Jules {
     explicit Jules(double K_p = 0.0, double K_i = 0.0, double K_d = 0.0, std::optional<double> integral_limit = std::optional<double>()) : K_p(K_p), K_i(K_i), K_d(K_d), integral_limit(integral_limit) {
         this->reset();
@@ -146,6 +161,7 @@ private:
         return (error - this->last_error) / dt;
     }
 };
+#endif
 
 struct Drivetrain {
     JNIEnv * env;
@@ -260,8 +276,16 @@ struct Drivetrain {
         if (this->isDead) return;
         //double yaw = this->getYaw();
         //strafing
+#if INVERT_X
+        double x = -(double)(libcardinal::altenv_get_field(this->env, this->gamepad, "left_stick_y", "F").f); //drive
+#else
         double x = (double)(libcardinal::altenv_get_field(this->env, this->gamepad, "left_stick_y", "F").f); //drive
+#endif
+#if INVERT_Y
+        double y = -(double)(libcardinal::altenv_get_field(this->env, this->gamepad, "left_stick_x", "F").f); //strafe
+#else
         double y = (double)(libcardinal::altenv_get_field(this->env, this->gamepad, "left_stick_x", "F").f); //strafe
+#endif
         bool slow = libcardinal::altenv_get_field(this->env, this->gamepad, "left_trigger", "F").f >= 0.7f;
 #if USE_DRIVER_ORIENTED
         //reorienting
@@ -351,10 +375,16 @@ struct Arm {
     //jobject arm_t;
     jobject gamepad;
     bool isDead;
+#if USE_JULES
     Jules jules;
     ArmTarget target;
+#endif
 
-    Arm(JNIEnv * env, jobject opMode) : isDead(false), env(env), opMode(env->NewGlobalRef(opMode)), jules(JULES_P, JULES_I, JULES_D) {
+    Arm(JNIEnv * env, jobject opMode) : isDead(false), env(env), opMode(env->NewGlobalRef(opMode))
+#if USE_JULES
+    , jules(JULES_P, JULES_I, JULES_D), target(TARGET_IN)
+#endif
+    {
         this->arm_bl = env->NewGlobalRef(libcardinal::altenv_get_device_from_hardware_map(env, opMode, "armbl", "com/qualcomm/robotcore/hardware/DcMotor"));
         this->arm_br = env->NewGlobalRef(libcardinal::altenv_get_device_from_hardware_map(env, opMode, "armbr", "com/qualcomm/robotcore/hardware/DcMotor"));
         //this->arm_t = env->NewGlobalRef(libcardinal::altenv_get_device_from_hardware_map(env, opMode, "armt", "com/qualcomm/robotcore/hardware/DcMotor"));
@@ -392,6 +422,7 @@ struct Arm {
             dpad_up = false;
             dpad_down = false;
         }
+#if USE_JULES
         if (dpad_up) {
             this->target = (ArmTarget)((int)this->target + 1);
             if ((int)this->target > 2) this->target = (ArmTarget)2;
@@ -403,7 +434,12 @@ struct Arm {
         jvalue negpower = {.d=-power.d};
         libcardinal::altenv_call_void_instance(this->env, this->arm_bl, "setPower", "(D)V", &power);
         libcardinal::altenv_call_void_instance(this->env, this->arm_br, "setPower", "(D)V", &negpower);
-        //libcardinal::altenv_call_void_instance(this->env, this->arm_t, "setPower", "(D)V", ry > 0.8 ? (ry > 0.0 ? const_cast<jvalue *>(&speed) : const_cast<jvalue *>(&neg_speed)) : const_cast<jvalue *>(&zero));
+#else
+        jvalue * upref = dpad_up ? &speed : (dpad_down ? &neg_speed : &zero);
+        jvalue * downref = dpad_up ? &neg_speed : (dpad_down ? &speed : &zero);
+        libcardinal::altenv_call_void_instance(this->env, this->arm_bl, "setPower", "(D)V", upref);
+        libcardinal::altenv_call_void_instance(this->env, this->arm_br, "setPower", "(D)V", downref);
+#endif
     }
 };
 #endif
@@ -445,6 +481,29 @@ struct Claw {
 };
 #endif
 
+#if USE_CTC
+struct CTC {
+    JNIEnv * env;
+    jobject opMode;
+    jobject llauncher;
+    jobject rlauncher;
+
+    CTC(JNIEnv * env, jobject opMode) : env(env), opMode(opMode) {
+        this->llauncher = env->NewGlobalRef(libcardinal::altenv_get_device_from_hardware_map(env, opMode, "llauncher", "com/qualcomm/robotcore/hardware/CRServo"));
+        this->rlauncher = env->NewGlobalRef(libcardinal::altenv_get_device_from_hardware_map(env, opMode, "rlauncher", "com/qualcomm/robotcore/hardware/CRServo"));
+    }
+    ~CTC() {
+        this->env->DeleteGlobalRef(llauncher);
+        this->env->DeleteGlobalRef(rlauncher);
+    }
+
+    void loop() const {
+        libcardinal::altenv_call_void_instance(env, this->llauncher, "setPower", "(D)V", &speed);
+        libcardinal::altenv_call_void_instance(env, this->rlauncher, "setPower", "(D)V", &neg_speed);
+    }
+};
+#endif
+
 //Shorthand for the JNI function below.
 void run(JNIEnv * env, jobject thiz) {
     /**
@@ -453,12 +512,16 @@ void run(JNIEnv * env, jobject thiz) {
      * this should be the only opmode.
      * **/
     libcardinal::setenv(env);
+    print("Size test: char = %i, short = %i, int = %i, long = %i, long long = %i", sizeof(char), sizeof(short), sizeof(int), sizeof(long), sizeof(long long));
     Drivetrain drivetrain(env, thiz);
 #if USE_ARM
     Arm arm(env, thiz);
 #endif
 #if USE_CLAW
     Claw claw(env, thiz);
+#endif
+#if USE_CTC
+    CTC ctc(env, thiz);
 #endif
     libcardinal::call_void_instance(thiz, "waitForStart", "()V", nullptr);
     while (libcardinal::call_instance(thiz, "opModeIsActive", "()Z", nullptr).z == JNI_TRUE) {
@@ -469,8 +532,13 @@ void run(JNIEnv * env, jobject thiz) {
 #if USE_CLAW
         claw.loop();
 #endif
+#if USE_CTC
+        ctc.loop();
+#endif
     }
 }
+
+#if USE_AUTO
 
 enum AutoControllerInstruction {
     FORWARD,
@@ -576,12 +644,20 @@ void runAutoStage(JNIEnv * env, jobject thiz) {
     }
 }
 
+#endif
+
 extern "C" JNIEXPORT void JNICALL Java_org_firstinspires_ftc_teamcode_Main_runOpMode(JNIEnv * env, jobject thiz) {
     run(env, thiz);
 }
+
 extern "C" JNIEXPORT void JNICALL Java_org_firstinspires_ftc_teamcode_Board_runOpMode(JNIEnv *env, jobject thiz) {
+#if USE_AUTO
     runAutoBoard(env, thiz);
+#endif
 }
+
 extern "C" JNIEXPORT void JNICALL Java_org_firstinspires_ftc_teamcode_Stage_runOpMode(JNIEnv *env, jobject thiz) {
+#if USE_AUTO
     runAutoStage(env, thiz);
+#endif
 }
