@@ -57,7 +57,7 @@ enum ArmTarget {
 //the speed multiplier of the motors
 //0.0 is none, 1.0 is full
 #define  SPEED 0.9
-#define  ARM_SPEED 0.8
+#define  ARM_SPEED 0.5
 
 //where the servo motor's open and closed positions are
 #define  LSERVO_OPEN 0.5
@@ -75,9 +75,17 @@ enum ArmTarget {
 #define  INTERNAL_TARGET_MID 50 //??
 #define  INTERNAL_TARGET_IN 0 //??
 
+//CTC settings
+
+#define  CTC_START 0
+#define  CTC_END 10000
+
 static jvalue speed = {.d=ARM_SPEED};
 static jvalue zero = {.d=0.0};
 static jvalue neg_speed = {.d=-ARM_SPEED};
+
+static jvalue ctc_start = {.i=CTC_START};
+static jvalue ctc_end = {.i=CTC_END};
 
 static inline double toRadians(double degrees) {
     return (degrees * M_PI) / 180.0;
@@ -485,21 +493,25 @@ struct Claw {
 struct CTC {
     JNIEnv * env;
     jobject opMode;
-    jobject llauncher;
-    jobject rlauncher;
+    jobject launcher;
+    jobject gamepad;
 
     CTC(JNIEnv * env, jobject opMode) : env(env), opMode(opMode) {
-        this->llauncher = env->NewGlobalRef(libcardinal::altenv_get_device_from_hardware_map(env, opMode, "llauncher", "com/qualcomm/robotcore/hardware/CRServo"));
-        this->rlauncher = env->NewGlobalRef(libcardinal::altenv_get_device_from_hardware_map(env, opMode, "rlauncher", "com/qualcomm/robotcore/hardware/CRServo"));
+        this->launcher = env->NewGlobalRef(libcardinal::altenv_get_device_from_hardware_map(env, opMode, "yuta", "com/qualcomm/robotcore/hardware/Servo"));
+        this->gamepad = env->NewGlobalRef(libcardinal::altenv_get_field(env, opMode, "gamepad1", "Lcom/qualcomm/robotcore/hardware/Gamepad;").l);
+        libcardinal::altenv_call_void_instance(this->env, this->launcher, "setTargetPosition", "(I)V", &ctc_start);
     }
+
     ~CTC() {
-        this->env->DeleteGlobalRef(llauncher);
-        this->env->DeleteGlobalRef(rlauncher);
+        this->env->DeleteGlobalRef(this->launcher);
+        this->env->DeleteGlobalRef(this->gamepad);
     }
 
     void loop() const {
-        libcardinal::altenv_call_void_instance(env, this->llauncher, "setPower", "(D)V", &speed);
-        libcardinal::altenv_call_void_instance(env, this->rlauncher, "setPower", "(D)V", &neg_speed);
+        bool launch = libcardinal::altenv_get_field(this->env, this->gamepad, "square", "Z").z == JNI_TRUE;
+        if (launch) {
+            libcardinal::altenv_call_void_instance(this->env, this->launcher, "setTargetPosition","(I)V", &ctc_end);
+        }
     }
 };
 #endif
